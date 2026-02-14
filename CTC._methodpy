@@ -1,0 +1,143 @@
+import torch
+import torch.nn.functional as F
+import numpy as np
+import sounddevice as sd
+import queue
+import math
+import torchaudio.transforms as T
+from tokenizers import Tokenizer
+
+# ================= CONFIG =================
+
+SAMPLE_RATE = 16000
+CHUNK_SIZE = 16000 * 2   # 2 seconds buffer
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+CHECKPOINT_PATH = "voice_to_text_model.pth"
+
+# ================= AUDIO PROCESSOR =================
+
+class AudioProcessor:
+    def __init__(self):
+        self.mel = T.MelSpectrogram(
+            sample_rate=SAMPLE_RATE, 
+            n_fft=400,
+            hop_length=160,
+            n_mels=80
+        )
+        self.db = T.AmplitudeToDB()
+
+    def process_waveform(self, waveform):
+        mel = self.mel(waveform)
+        mel = self.db(mel)
+        return mel.squeeze(0).transpose(0, 1)  # (time, n_mels)
+
+# ================= LOAD MODEL =================
+
+def load_model():
+    checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
+
+    from code_execution import VoiceToTextTransformer  # change filename
+
+    config = checkpoint["config"]
+
+    model = VoiceToTextTransformer(
+        n_mels=config["n_mels"],
+        vocab_size=checkpoint["vocab_size"],
+        d_model=config["d_model"],
+        n_heads=config["n_heads"],
+        n_layers=config["n_layers"],
+        d_ff=config["d_ff"]
+    ).to(DEVICE)
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
+    tokenizer = Tokenizer.from_file(checkpoint["tokenizer_path"])
+
+    return model, tokenizer
+
+# ================= MASKS =================
+
+def create_audio_mask(audio_len, max_len):
+    mask = torch.arange(max_len, device=DEVICE) < audio_len
+    return mask.unsqueeze(0).unsqueeze(1).unsqueeze(2)
+
+def create_text_mask(size):
+    return torch.tril(torch.ones(size, size, device=DEVICE)).bool().unsqueeze(0).unsqueeze(0)
+
+# ================= GREEDY DECODER =================
+
+def greedy_decode(model, mel, tokenizer, max_len=100):
+    SOS = 2
+    EOS = 3
+
+    mel = mel.unsqueeze(0).to(DEVICE)
+    audio_len = torch.tensor([mel.size(1)], device=DEVICE)
+
+    audio_mask = create_audio_mask(audio_len, mel.size(1))
+    enc_output = model.encode(mel, audio_mask)
+
+    generated = torch.tensor([[SOS]], device=DEVICE)
+
+    for _ in range(max_len):
+        text_mask = create_text_mask(generated.size(1))
+
+        dec_output = model.decode(
+            generated,
+            enc_output,
+            audio_mask,
+            text_mask
+        )
+
+        logits = model.output_proj(dec_output[:, -1])
+        next_token = torch.argmax(F.softmax(logits, dim=-1), dim=-1)
+
+        generated = torch.cat([generated, next_token.unsqueeze(1)], dim=1)
+
+        if next_token.item() == EOS:
+            break
+
+    tokens = generated.squeeze(0).tolist()[1:]
+    if EOS in tokens:
+        tokens = tokens[:tokens.index(EOS)]
+
+    print("Generated token ids:", tokens)
+    return tokenizer.decode(tokens)
+
+
+# ================= REAL-TIME LOOP =================
+
+def main():
+    print("Loading model...")
+    model, tokenizer = load_model()
+    processor = AudioProcessor()
+
+    q = queue.Queue()
+
+    def callback(indata, frames, time, status):
+        q.put(indata.copy())
+
+    print("🎤 Listening... Speak now.")
+
+    with sd.InputStream(
+        samplerate=SAMPLE_RATE,
+        channels=1,
+        callback=callback
+    ):
+        buffer = np.zeros((0, 1), dtype=np.float32)
+
+        while True:
+            data = q.get()
+            buffer = np.concatenate((buffer, data), axis=0)
+
+            if len(buffer) >= CHUNK_SIZE:
+                waveform = torch.tensor(buffer[:CHUNK_SIZE].T)
+                buffer = buffer[CHUNK_SIZE:]
+
+                mel = processor.process_waveform(waveform)
+                text = greedy_decode(model, mel, tokenizer)
+
+                print("📝", text)
+
+if __name__ == "__main__":
+    main()
