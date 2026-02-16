@@ -138,8 +138,9 @@ def collate_fn(batch):
 # ===================== CONV SUBSAMPLING =====================
 
 class ConvSubsampling(nn.Module):
-    def __init__(self, d_model=256):
+    def __init__(self, input_dim=80, d_model=256):
         super().__init__()
+
         self.conv = nn.Sequential(
             nn.Conv2d(1, d_model, 3, stride=2),
             nn.ReLU(),
@@ -147,13 +148,21 @@ class ConvSubsampling(nn.Module):
             nn.ReLU()
         )
 
+        # Compute output frequency dimension dynamically
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, 100, input_dim)
+            out = self.conv(dummy)
+            _, C, _, F = out.shape
+            self.output_dim = C * F
+
     def forward(self, x):
-        x = x.unsqueeze(1)  # (B,1,T,F)
+        x = x.unsqueeze(1)
         x = self.conv(x)
         B, C, T, F = x.size()
         x = x.permute(0, 2, 1, 3).contiguous()
         x = x.view(B, T, C * F)
         return x
+
 
 # ===================== POSITIONAL ENCODING =====================
 
@@ -201,8 +210,9 @@ class CTCTransformer(nn.Module):
     def __init__(self, vocab_size, d_model=256, n_heads=4, n_layers=6, d_ff=1024):
         super().__init__()
 
-        self.subsampling = ConvSubsampling(d_model)
-        self.input_linear = nn.Linear(d_model * 19, d_model)
+        self.subsampling = ConvSubsampling(input_dim=80, d_model=d_model)
+        self.input_linear = nn.Linear(self.subsampling.output_dim, d_model)
+
         self.pos_encoding = PositionalEncoding(d_model)
 
         self.layers = nn.ModuleList([
@@ -290,3 +300,21 @@ if __name__ == "__main__":
     for epoch in range(EPOCHS):
         loss = train_epoch(model, loader, optimizer, criterion, device)
         print(f"Epoch {epoch+1}: Loss = {loss:.4f}")
+    
+    torch.save({
+    "model_state_dict": model.state_dict(),
+    "config": {
+        "vocab_size": vocab_size,
+        "d_model": 256,
+        "n_heads": 4,
+        "n_layers": 6,
+        "d_ff": 1024
+    },
+    "vocab": {
+        "char2idx": char2idx,
+        "idx2char": idx2char
+    },
+    "version": "1.0.0"
+}, "ctc_asr_model.pt")
+
+print("Model saved successfully.")
